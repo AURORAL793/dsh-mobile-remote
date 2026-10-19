@@ -169,6 +169,10 @@
       }, 300);
     }
 
+    // 暴露给外部函数（showHint / boot 的自动演示）
+    window.__dsmOpenDrawer = openDrawer;
+    window.__dsmCloseDrawer = closeDrawer;
+
     btn.addEventListener('click', function () { open ? closeDrawer() : openDrawer(); });
     mask.addEventListener('click', closeDrawer);
 
@@ -206,8 +210,10 @@
         '<div style="margin-bottom:10px;">② 选过一次后，手机会记住</div>' +
         '<div style="margin:-4px 0 12px 18px;color:#a8b8d4;">下次打开自动回到这个会话</div>' +
         '<div style="margin-bottom:16px;">③ 手机返回键 / 边缘滑动 → 回到文件浏览</div>' +
-        '<button id="dsm-hint-ok" style="width:100%;padding:13px;border:0;border-radius:14px;' +
-        'background:linear-gradient(135deg,#4f8cff,#8b5cf6);color:#fff;font-size:16px;font-weight:650;font-family:inherit;">知道了</button>' +
+        '<button id="dsm-hint-open" style="width:100%;padding:13px;border:0;border-radius:14px;margin-bottom:8px;' +
+        'background:linear-gradient(135deg,#4f8cff,#8b5cf6);color:#fff;font-size:16px;font-weight:650;font-family:inherit;">打开侧边栏看看</button>' +
+        '<button id="dsm-hint-ok" style="width:100%;padding:11px;border:1px solid rgba(255,255,255,.18);border-radius:14px;' +
+        'background:transparent;color:#a8b8d4;font-size:14px;font-family:inherit;">知道了</button>' +
       '</div>';
     document.body.appendChild(overlay);
 
@@ -216,6 +222,10 @@
       overlay.remove();
     }
     document.getElementById('dsm-hint-ok').addEventListener('click', close);
+    document.getElementById('dsm-hint-open').addEventListener('click', function () {
+      close();
+      setTimeout(function () { try { if (window.__dsmOpenDrawer) window.__dsmOpenDrawer(); } catch (err) { /* ignore */ } }, 180);
+    });
     overlay.addEventListener('click', function (e) {
       if (e.target === overlay) close();
     });
@@ -229,7 +239,21 @@
         clearInterval(timer);
         injectStyle();
         injectChrome();
-        setTimeout(showHint, 900);
+        setTimeout(function () {
+          var seenHint = localStorage.getItem(HINT_KEY) === '1';
+          showHint();
+          // 首次（新标记）自动滑出一次侧边栏，让用户知道入口在哪
+          if (localStorage.getItem('dsm-drawer-intro') !== '1') {
+            localStorage.setItem('dsm-drawer-intro', '1');
+            setTimeout(function () {
+              // 有引导弹窗时等用户关掉再演示；没有则直接演示
+              if (!document.getElementById('dsm-hint-overlay')) {
+                try { if (window.__dsmOpenDrawer) window.__dsmOpenDrawer(); } catch (err) { /* ignore */ }
+                setTimeout(function () { try { if (window.__dsmCloseDrawer) window.__dsmCloseDrawer(); } catch (err) { /* ignore */ } }, 2800);
+              }
+            }, seenHint ? 900 : 4200);
+          }
+        }, 900);
       } else if (++tries > 60) {
         clearInterval(timer);
       }
