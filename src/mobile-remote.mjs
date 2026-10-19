@@ -311,18 +311,53 @@ export function apply(ctx, config = {}) {
       let port = cfg.port || dshPort2
       if (bindHost === dshHost2) port = dshPort2 + 1
 
-      /* 2. 取认证 cookie（优先进程内 launchToken；拿不到就回退浏览器历史 token） */
-      let cookie = ''
-      try {
-        const conn = (typeof c2.get === 'function' ? c2.get('connection') : null) || c2.connection
-        const token = conn && conn.browserAuth && conn.browserAuth.launchToken
-        if (token) cookie = await exchangeToken(dshHost2, dshPort2, token)
-      } catch (err) { /* 忽略 */ }
-      if (!cookie) {
-        cookie = await cookieFromBrowserHistory(dshHost2, dshPort2)
-        if (cookie) log('已通过浏览器历史 token 获取 cookie')
+      /* 2. 认证 cookie：实时获取 + 后台重试（启动时 connection 服务可能尚未就绪） */
+      let authCookie = ''
+      let authCookieAt = 0
+      let authPromise = null
+      const ensureAuthCookie = async (force = false) => {
+        const now = Date.now()
+        if (!force && authCookie && now - authCookieAt < 5 * 60 * 1000) return authCookie
+        if (authPromise) return authPromise
+        authPromise = (async () => {
+          // 1) 进程内 launchToken（每次实时向 connection 服务取，不缓存连接对象）
+          try {
+            const conn = (typeof c2.get === 'function' ? c2.get('connection') : null) || c2.connection
+            const token = conn && conn.browserAuth && conn.browserAuth.launchToken
+            if (token) {
+              const ck = await exchangeToken(dshHost2, dshPort2, token)
+              if (ck) {
+                authCookie = ck
+                authCookieAt = Date.now()
+                log('已获取 DSH cookie（launchToken）')
+                return ck
+              }
+            }
+          } catch (err) { /* ignore */ }
+          // 2) 浏览器历史 token 兜底
+          try {
+            const ck = await cookieFromBrowserHistory(dshHost2, dshPort2)
+            if (ck) {
+              authCookie = ck
+              authCookieAt = Date.now()
+              log('已获取 DSH cookie（浏览器历史）')
+              return ck
+            }
+          } catch (err) { /* ignore */ }
+          return ''
+        })()
+        const result = await authPromise
+        authPromise = null
+        return result
       }
-      if (!cookie) log('警告：未换到 DSH cookie，AI 页面可能需要手动处理认证')
+      // 后台预取：connection 可能稍后才就绪（最多重试 30 次 × 2 秒）
+      ;(async () => {
+        for (let i = 0; i < 30; i++) {
+          if (await ensureAuthCookie(true)) return
+          await new Promise((resolve) => setTimeout(resolve, 2000))
+        }
+        log('警告：仍未获取到 DSH cookie，AI 页面可能短暂返回等待页（会自动重试）')
+      })()
 
       /* 3. 内部文件服务（Python + Pillow） */
       // 优先用插件内置的便携 Python（别人拿到不用装环境），没有才回退系统 python
@@ -423,7 +458,7 @@ export function apply(ctx, config = {}) {
       }
 
       /* ---------------- DSH 反代 ---------------- */
-      function upstreamHeaders(req) {
+      function upstreamHeaders(req, cookie) {
         const h = { ...req.headers }
         h.host = dsh.hostHeader
         delete h.cookie
@@ -434,57 +469,100 @@ export function apply(ctx, config = {}) {
         return h
       }
 
-      function proxyDsh(req, res) {
-        const pathname = (req.url || '/').split('?')[0]
-        const isDocument = req.method === 'GET' && (pathname === '/' || pathname === '/index.html')
-        const upHeaders = upstreamHeaders(req)
-        if (isDocument) delete upHeaders['accept-encoding']
-
-        const proxyReq = http.request({
-          host: dsh.host,
-          port: dsh.port,
-          method: req.method,
-          path: req.url,
-          headers: upHeaders,
-        }, (proxyRes) => {
-          const headers = { ...proxyRes.headers }
-          delete headers['set-cookie']
-          delete headers['strict-transport-security']
-
-          // 页面文档注入手机端脚本
-          if (isDocument && /text\/html/i.test(String(headers['content-type'] || ''))) {
-            const chunks = []
-            proxyRes.on('data', (chunk) => chunks.push(chunk))
-            proxyRes.on('end', () => {
-              let html = Buffer.concat(chunks).toString('utf8')
-              const tag = '<script src="/__mobile/mobile.js" defer></script>'
-              html = html.includes('</body>') ? html.replace('</body>', tag + '</body>') : html + tag
-              const buf = Buffer.from(html, 'utf8')
-              headers['content-length'] = String(buf.length)
-              delete headers['transfer-encoding']
-              delete headers['content-encoding']
-              res.writeHead(proxyRes.statusCode, headers)
-              res.end(buf)
-            })
-            proxyRes.on('error', () => { try { res.destroy() } catch (e) { /* ignore */ } })
-            return
-          }
-
-          res.writeHead(proxyRes.statusCode, headers)
-          proxyRes.pipe(res)
+      /** 认证等待页：DSH cookie 还没就绪时给用户一个自动重试的页面。 */
+      function waitingPage(res, retryAfter = 3) {
+        res.writeHead(503, {
+          'content-type': 'text/html; charset=utf-8',
+          'cache-control': 'no-store',
+          'retry-after': String(retryAfter),
         })
-
-        proxyReq.on('error', (err) => {
-          if (res.headersSent) return
-          text(res, 502, '无法连接 DSH 服务：' + err.message)
-        })
-        req.pipe(proxyReq)
+        res.end('<!doctype html><html><head><meta charset="utf-8">'
+          + '<meta name="viewport" content="width=device-width,initial-scale=1">'
+          + `<meta http-equiv="refresh" content="${retryAfter}">`
+          + '<title>正在连接 DSH…</title></head>'
+          + '<body style="font-family:system-ui,-apple-system,sans-serif;padding:40px 24px;max-width:560px;margin:auto;line-height:1.8">'
+          + '<h2>⏳ 正在连接 DSH…</h2>'
+          + '<p>插件正在获取 DSH 认证，请稍候（页面会自动刷新）。</p>'
+          + '<p style="color:#888;font-size:14px">如果长时间停留在这里，请重启一次 DSH 后刷新。</p>'
+          + '</body></html>')
       }
+
+      async function proxyDsh(req, res, retried = false) {
+        try {
+          const pathname = (req.url || '/').split('?')[0]
+          const isDocument = req.method === 'GET' && (pathname === '/' || pathname === '/index.html')
+          const cookie = await ensureAuthCookie()
+          const upHeaders = upstreamHeaders(req, cookie)
+          if (isDocument) delete upHeaders['accept-encoding']
+
+          const proxyReq = http.request({
+            host: dsh.host,
+            port: dsh.port,
+            method: req.method,
+            path: req.url,
+            headers: upHeaders,
+          }, (proxyRes) => {
+            // cookie 失效：强制刷新后自动重试一次（只对 GET/HEAD，避免请求体丢失）
+            if (proxyRes.statusCode === 401 && (req.method === 'GET' || req.method === 'HEAD')) {
+              proxyRes.resume()
+              if (!retried) {
+                authCookie = ''
+                authCookieAt = 0
+                log('DSH 返回 401，刷新 cookie 后重试')
+                ensureAuthCookie(true).finally(() => setTimeout(() => proxyDsh(req, res, true), 150))
+                return
+              }
+              // 重试后仍 401：返回自动刷新等待页，而不是 DSH 的错误页
+              waitingPage(res, 3)
+              return
+            }
+
+            const headers = { ...proxyRes.headers }
+            delete headers['set-cookie']
+            delete headers['strict-transport-security']
+
+            // 页面文档注入手机端脚本
+            if (isDocument && /text\/html/i.test(String(headers['content-type'] || ''))) {
+              const chunks = []
+              proxyRes.on('data', (chunk) => chunks.push(chunk))
+              proxyRes.on('end', () => {
+                let html = Buffer.concat(chunks).toString('utf8')
+                const tag = '<script src="/__mobile/mobile.js" defer></script>'
+                html = html.includes('</body>') ? html.replace('</body>', tag + '</body>') : html + tag
+                const buf = Buffer.from(html, 'utf8')
+                headers['content-length'] = String(buf.length)
+                delete headers['transfer-encoding']
+                delete headers['content-encoding']
+                res.writeHead(proxyRes.statusCode, headers)
+                res.end(buf)
+              })
+              proxyRes.on('error', () => { try { res.destroy() } catch (e) { /* ignore */ } })
+              return
+            }
+
+            res.writeHead(proxyRes.statusCode, headers)
+            proxyRes.pipe(res)
+          })
+
+          proxyReq.on('error', (err) => {
+            if (res.headersSent) return
+            text(res, 502, '无法连接 DSH 服务：' + err.message)
+          })
+          req.pipe(proxyReq)
+        } catch (err) {
+          log('DSH 反代异常：', err && err.message)
+          if (!res.headersSent) {
+            try { text(res, 500, '代理异常：' + (err && err.message)) } catch (e) { /* ignore */ }
+          }
+        }
+      }
+
+      /* ---------------- WebSocket 反代 ---------------- */
 
       /* ---------------- WebSocket 反代 ---------------- */
       function upgrade(req, socket, head) {
         const upstream = net.connect(dsh.port, dsh.host, () => {
-          const h = upstreamHeaders(req)
+          const h = upstreamHeaders(req, authCookie)
           delete h.connection
           delete h.upgrade
           delete h['sec-websocket-key']
