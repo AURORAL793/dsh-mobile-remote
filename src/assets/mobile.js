@@ -119,6 +119,18 @@
     '#dsm-panel:active { transform: scale(.92); background: rgba(52,66,90,.92); }',
     'body.dsm-sb-open #dsm-panel { opacity: 0; pointer-events: none; }',
     'body.dsm-right-open #dsm-panel { background: rgba(79,140,255,.9); }',
+    /* ---- 壁纸（手机/平板专用）----
+       不依赖 wallpaper 插件的 CSS 变量与 background-attachment:fixed
+       （老 Android / 华为浏览器对 fixed 背景支持差，图片层会不渲染） */
+    'body {',
+    '  background-image: linear-gradient(rgba(9,11,15,0.30), rgba(9,11,15,0.30)), url("/dsh-bg-img/session.png") !important;',
+    '  background-size: auto, cover !important;',
+    '  background-position: center, center !important;',
+    '  background-repeat: no-repeat !important;',
+    '  background-attachment: scroll !important;',
+    '  background-color: #0b0e14 !important;',
+    '}',
+    '#root, #root > div, [class*="frame"] { background-color: transparent !important; }',
     /* ---- 给 ☰ 让出位置 ---- */
     '[class*="centerCol"] header { padding-left: 56px !important; padding-right: 140px !important; }',
     /* ---- 隐藏桌面专属控件 ---- */
