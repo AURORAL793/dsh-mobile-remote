@@ -113,6 +113,7 @@ const state = {
   url: '',
   filesUrl: '',
   error: '',
+  mobileTheme: '',
 }
 
 const log = (...args) => {
@@ -259,11 +260,14 @@ export function apply(ctx, config = {}) {
     port: Number(config.port) || 0,
     bindHost: String(config.bindHost || ''),
     filesPort: Number(config.filesPort) || 8789,
+    mobileTheme: String(config.mobileTheme || ''),
   }
   if (!cfg.enabled) {
     log('已按配置禁用')
     return
   }
+  state.mobileTheme = cfg.mobileTheme
+  log(`移动端主题: ${cfg.mobileTheme || '跟随系统'}`)
 
   ctx.inject(['webServer'], (c) => {
     log('webServer 已注入')
@@ -407,6 +411,16 @@ export function apply(ctx, config = {}) {
       /* ---------------- 路由分流 ---------------- */
       function route(req, res) {
         const pathname = (req.url || '/').split('?')[0]
+        // 访问日志：记录文档/注入脚本请求（排查多设备与缓存问题）
+        try {
+          if (req.method === 'GET' && (pathname === '/' || pathname === '/index.html' || pathname === '/__mobile/mobile.js')) {
+            const rawIp = req.headers['cf-connecting-ip'] || req.socket.remoteAddress || ''
+            const ip = String(rawIp).replace(/^::ffff:/, '')
+            const ua = String(req.headers['user-agent'] || '').slice(0, 90)
+            const ref = String(req.headers['referer'] || '').slice(0, 80)
+            log(`访问 ${pathname} from ${ip} UA=${ua} REF=${ref}`)
+          }
+        } catch (err) { /* ignore */ }
 
         // 手机端注入脚本
         if (pathname === '/__mobile/mobile.js') {
@@ -521,8 +535,12 @@ export function apply(ctx, config = {}) {
             delete headers['set-cookie']
             delete headers['strict-transport-security']
 
-            // 页面文档注入手机端脚本
+            // 页面文档注入手机端脚本（并强制不缓存，避免手机/平板拿到旧页面）
             if (isDocument && /text\/html/i.test(String(headers['content-type'] || ''))) {
+              headers['cache-control'] = 'no-store, no-cache, must-revalidate'
+              headers['pragma'] = 'no-cache'
+              delete headers.etag
+              delete headers['last-modified']
               const chunks = []
               proxyRes.on('data', (chunk) => chunks.push(chunk))
               proxyRes.on('end', () => {

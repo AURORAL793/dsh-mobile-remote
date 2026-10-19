@@ -119,17 +119,6 @@
     '#dsm-panel:active { transform: scale(.92); background: rgba(52,66,90,.92); }',
     'body.dsm-sb-open #dsm-panel { opacity: 0; pointer-events: none; }',
     'body.dsm-right-open #dsm-panel { background: rgba(79,140,255,.9); }',
-    /* ---- 壁纸（手机/平板专用）----
-       只覆盖两项，其余（size/position/repeat）完全跟随电脑端的计算结果：
-         1. background-image：去掉 CSS 变量与 fixed 依赖，保证老 Android 能渲染
-         2. background-attachment: scroll（老 Android 不支持 fixed） */
-    'body {',
-    '  background-image: linear-gradient(rgba(255,255,255,0.35), rgba(255,255,255,0.35)), url("/dsh-bg-img/session.png") !important;',
-    '  background-attachment: scroll, scroll !important;',
-    '}',
-    'body[data-ds-dark-theme] {',
-    '  background-image: linear-gradient(rgba(21,21,23,0.35), rgba(21,21,23,0.35)), url("/dsh-bg-img/session.png") !important;',
-    '}',
     /* ---- 给 ☰ 让出位置 ---- */
     '[class*="centerCol"] header { padding-left: 56px !important; padding-right: 140px !important; }',
     /* ---- 隐藏桌面专属控件 ---- */
@@ -165,6 +154,49 @@
     '}',
     'body { padding-bottom: env(safe-area-inset-bottom, 0px); }',
   ].join('\n');
+
+  /* 壁纸修复：所有移动设备（手机 + 平板）。
+     只覆盖 image 与 attachment 两项，其余（size/position/repeat）跟随电脑端，
+     这样手机/平板与电脑网页的壁纸外观完全一致。 */
+  var WALLPAPER_CSS = [
+    'body {',
+    '  background-image: linear-gradient(rgba(255,255,255,0.35), rgba(255,255,255,0.35)), url("/dsh-bg-img/session.png") !important;',
+    '  background-attachment: scroll, scroll !important;',
+    '}',
+    'body[data-ds-dark-theme] {',
+    '  background-image: linear-gradient(rgba(21,21,23,0.35), rgba(21,21,23,0.35)), url("/dsh-bg-img/session.png") !important;',
+    '}',
+  ].join('\n');
+
+  function injectWallpaperStyle() {
+    if (document.getElementById('dsm-wallpaper')) return;
+    var st = document.createElement('style');
+    st.id = 'dsm-wallpaper';
+    st.textContent = WALLPAPER_CSS;
+    document.head.appendChild(st);
+  }
+
+  /* 主题同步：从插件 info 读取 mobileTheme（dark/light），强制应用到本设备，
+     让手机/平板与电脑端主题一致（默认留空 = 跟随系统，不干预）。 */
+  function applyTheme() {
+    fetch('/dsh-mobile-remote/info', { cache: 'no-store' })
+      .then(function (r) { return r.json(); })
+      .then(function (info) {
+        var theme = info && info.mobileTheme;
+        if (theme !== 'dark' && theme !== 'light') return;
+        var html = document.documentElement;
+        var wasDark = document.body.hasAttribute('data-ds-dark-theme');
+        html.setAttribute('data-ds-theme-source', theme);
+        html.style.colorScheme = theme;
+        if (theme === 'dark') document.body.setAttribute('data-ds-dark-theme', '');
+        else document.body.removeAttribute('data-ds-dark-theme');
+        if ((theme === 'dark') !== wasDark) {
+          // 主题变化后 DSH 可能需要重算样式
+          setTimeout(function () { try { window.dispatchEvent(new Event('resize')); } catch (e) { /* ignore */ } }, 80);
+        }
+      })
+      .catch(function () { /* ignore */ });
+  }
 
   function injectStyle() {
     if (document.getElementById('dsm-style')) return;
@@ -337,6 +369,18 @@
   }
 
   function boot() {
+    // 只对移动设备做增强（电脑网页完全不动）
+    var isMobileDevice = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent);
+    if (!isMobileDevice) return;
+
+    // 1) 壁纸修复 + 主题同步：所有移动设备（手机 + 平板）
+    injectWallpaperStyle();
+    applyTheme();
+
+    // 2) 手机 UI：仅窄屏手机；平板保持 DSH 桌面布局（与电脑网页外观一致）
+    var isPhone = window.innerWidth < 768;
+    if (!isPhone) return;
+
     injectStyle();
     var tries = 0;
     var timer = setInterval(function () {
