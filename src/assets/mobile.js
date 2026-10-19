@@ -98,15 +98,51 @@
     '#dsm-files:active { transform: scale(.94); background: rgba(52,66,90,.92); }',
     '#dsm-files svg { width: 16px; height: 16px; }',
     'body.dsm-sb-open #dsm-files { opacity: 0; pointer-events: none; }',
+    /* ---- 右上角「右侧面板」按钮 ---- */
+    '#dsm-panel {',
+    '  position: fixed;',
+    '  top: calc(8px + env(safe-area-inset-top, 0px));',
+    '  right: 90px;',
+    '  z-index: 850;',
+    '  width: 40px; height: 40px;',
+    '  border-radius: 12px;',
+    '  display: grid; place-items: center;',
+    '  background: rgba(20,26,38,.82);',
+    '  color: #e9eefb;',
+    '  border: 1px solid rgba(255,255,255,.12);',
+    '  -webkit-backdrop-filter: blur(14px); backdrop-filter: blur(14px);',
+    '  box-shadow: 0 4px 16px rgba(0,0,0,.35);',
+    '  padding: 0; margin: 0; cursor: pointer;',
+    '  transition: transform .12s ease, background .15s;',
+    '  -webkit-tap-highlight-color: transparent;',
+    '}',
+    '#dsm-panel:active { transform: scale(.92); background: rgba(52,66,90,.92); }',
+    'body.dsm-sb-open #dsm-panel { opacity: 0; pointer-events: none; }',
+    'body.dsm-right-open #dsm-panel { background: rgba(79,140,255,.9); }',
     /* ---- 给 ☰ 让出位置 ---- */
-    '[class*="centerCol"] header { padding-left: 56px !important; padding-right: 96px !important; }',
+    '[class*="centerCol"] header { padding-left: 56px !important; padding-right: 140px !important; }',
     /* ---- 隐藏桌面专属控件 ---- */
-    'button[aria-label="打开右侧边栏"],',
-    'button[aria-label="收起右侧边栏"],',
     'button[aria-label="分栏"],',
     'button[aria-label="新标签页"],',
-    'button[aria-label="退出全屏"],',
-    'button[aria-label="收起侧边栏"] { display: none !important; }',
+    'button[aria-label="退出全屏"] { display: none !important; }',
+    /* ---- 右侧栏：手机端覆盖式抽屉（工作区文件 / 终端等）---- */
+    '[class*="rightbarCol"] {',
+    '  position: fixed !important;',
+    '  top: 0; bottom: 0; right: 0;',
+    '  width: min(88vw, 380px) !important;',
+    '  height: 100vh !important;',
+    '  z-index: 820 !important;',
+    '  background: #17171a;',
+    '  transform: translateX(102%);',
+    '  transition: transform .24s ease;',
+    '  box-shadow: -14px 0 44px rgba(0,0,0,.55);',
+    '  display: block !important;',
+    '}',
+    'body.dsm-right-open [class*="rightbarCol"] { transform: translateX(0); }',
+    '#dsm-right-mask { position: fixed; inset: 0; z-index: 819; background: rgba(0,0,0,.42);',
+    '  opacity: 0; pointer-events: none; transition: opacity .22s; }',
+    'body.dsm-right-open #dsm-right-mask { opacity: 1; pointer-events: auto; }',
+    'body.dsm-right-open #dsm-menu, body.dsm-right-open #dsm-files { opacity: 0; pointer-events: none; }',
     /* ---- 输入框：16px 防止 iOS 聚焦自动放大 ---- */
     '[contenteditable="true"] { font-size: 16px !important; }',
     /* ---- 底部安全区 ---- */
@@ -147,6 +183,47 @@
       'stroke-linecap="round" stroke-linejoin="round"><path d="M3 8.5A2.5 2.5 0 015.5 6h3.2l2 2.4h7.8A2.5 2.5 0 0121 10.9v6.6A2.5 2.5 0 0118.5 20h-13A2.5 2.5 0 013 17.5v-9z"/></svg><span>文件</span>';
     filesBtn.addEventListener('click', function () { location.href = '/files/'; });
     document.body.appendChild(filesBtn);
+
+    // 右上角：右侧面板（工作区文件 / 终端 / 插件面板）
+    var panelBtn = document.createElement('button');
+    panelBtn.id = 'dsm-panel';
+    panelBtn.setAttribute('aria-label', '右侧面板');
+    panelBtn.innerHTML = '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
+      'stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
+      '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M15 4v16"/></svg>';
+    panelBtn.addEventListener('click', function () {
+      document.body.classList.toggle('dsm-right-open');
+    });
+    document.body.appendChild(panelBtn);
+
+    // ---- 右侧栏：遮罩 + 接管开关（手机端抽屉）----
+    var rightMask = document.createElement('div');
+    rightMask.id = 'dsm-right-mask';
+    document.body.appendChild(rightMask);
+    rightMask.addEventListener('click', function () {
+      document.body.classList.remove('dsm-right-open');
+    });
+
+    function bindRightButtons() {
+      var openBtn = findBtn('打开右侧边栏');
+      var closeBtn = findBtn('收起右侧边栏');
+      if (openBtn && openBtn.dataset.dsmRightBound !== '1') {
+        openBtn.dataset.dsmRightBound = '1';
+        openBtn.addEventListener('click', function () {
+          document.body.classList.add('dsm-right-open');
+        });
+      }
+      if (closeBtn && closeBtn.dataset.dsmRightBound !== '1') {
+        closeBtn.dataset.dsmRightBound = '1';
+        closeBtn.addEventListener('click', function () {
+          document.body.classList.remove('dsm-right-open');
+        });
+      }
+    }
+    bindRightButtons();
+    // 按钮可能是延迟渲染的，隔段时间再绑一次
+    setTimeout(bindRightButtons, 1200);
+    setTimeout(bindRightButtons, 3000);
 
     var open = false;
 
