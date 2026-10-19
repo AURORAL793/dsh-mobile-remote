@@ -17,16 +17,70 @@ function Step($msg) { Write-Host "[*] $msg" -ForegroundColor Cyan }
 function Ok($msg)   { Write-Host "[+] $msg" -ForegroundColor Green }
 function Err($msg)  { Write-Host "[-] $msg" -ForegroundColor Red }
 
-function Find-DshHome {
-    $candidates = @()
-    if ($DshHome) { $candidates += $DshHome }
-    if ($env:DSH_HOME) { $candidates += $env:DSH_HOME }
-    $candidates += (Join-Path $env:USERPROFILE '.dsh')
-    foreach ($c in $candidates) {
-        if ([string]::IsNullOrWhiteSpace($c)) { continue }
-        if (Test-Path (Join-Path $c 'profiles\web\cordis.patch.yml')) { return (Resolve-Path $c).Path }
+function Test-DshHome([string]$p) {
+    if ([string]::IsNullOrWhiteSpace($p)) { return $false }
+    try { return Test-Path (Join-Path $p 'profiles\web\cordis.patch.yml') } catch { return $false }
+}
+
+function Get-DshHomeCandidates {
+    $list = New-Object System.Collections.Generic.List[string]
+    function Add-Candidate([string]$p) {
+        if ([string]::IsNullOrWhiteSpace($p)) { return }
+        if (-not (Test-DshHome $p)) { return }
+        try { $resolved = (Resolve-Path $p).Path } catch { return }
+        if (-not $list.Contains($resolved)) { $list.Add($resolved) }
     }
-    return $null
+    Add-Candidate (Join-Path $env:USERPROFILE '.dsh')
+    Add-Candidate (Join-Path $env:APPDATA 'dsh')
+    Add-Candidate (Join-Path $env:LOCALAPPDATA 'dsh')
+    try {
+        $drives = [System.IO.DriveInfo]::GetDrives() | Where-Object { $_.DriveType -eq 'Fixed' -and $_.IsReady }
+        foreach ($d in $drives) {
+            $root = $d.RootDirectory.FullName
+            $dirs = @()
+            try { $dirs = [System.IO.Directory]::GetDirectories($root) } catch { continue }
+            foreach ($dir in $dirs) {
+                $leaf = Split-Path $dir -Leaf
+                if ($leaf -match '^(Windows|Program Files|Program Files \(x86\)|ProgramData|Users|Recovery|System Volume Information|\$Recycle\.Bin)$') { continue }
+                foreach ($c in @($dir, (Join-Path $dir 'data'), (Join-Path $dir 'dsh'), (Join-Path $dir 'DSH'), (Join-Path $dir 'deepseek'), (Join-Path $dir 'DeepSeek'))) {
+                    Add-Candidate $c
+                }
+                try {
+                    foreach ($sub in [System.IO.Directory]::GetDirectories($dir)) {
+                        foreach ($c2 in @($sub, (Join-Path $sub 'data'), (Join-Path $sub 'dsh'))) {
+                            Add-Candidate $c2
+                        }
+                    }
+                } catch { }
+            }
+        }
+    } catch { }
+    return $list
+}
+
+function Find-DshHome {
+    # 1) explicit parameter
+    if (Test-DshHome $DshHome) { return (Resolve-Path $DshHome).Path }
+    # 2) environment variable (when invoked from inside DSH)
+    if (Test-DshHome $env:DSH_HOME) { return (Resolve-Path $env:DSH_HOME).Path }
+
+    $candidates = Get-DshHomeCandidates
+    if ($candidates.Count -eq 0) { return $null }
+    if ($candidates.Count -eq 1) { return $candidates[0] }
+
+    # multiple candidates: pick the one whose patch file changed most recently
+    $best = $null
+    $bestTime = [datetime]::MinValue
+    Write-Host '[!] Found multiple DSH data directories:' -ForegroundColor Yellow
+    foreach ($c in $candidates) {
+        $t = [datetime]::MinValue
+        try { $t = (Get-Item (Join-Path $c 'profiles\web\cordis.patch.yml')).LastWriteTime } catch { }
+        Write-Host ("      - {0}  (last modified: {1})" -f $c, $t)
+        if ($t -gt $bestTime) { $bestTime = $t; $best = $c }
+    }
+    Write-Host "[!] Using the most recently modified one: $best" -ForegroundColor Yellow
+    Write-Host '    (To pick another: install.bat -DshHome <path>)' -ForegroundColor DarkGray
+    return $best
 }
 
 $dshRoot = Find-DshHome
