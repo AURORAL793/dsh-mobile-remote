@@ -126,29 +126,25 @@
     'button[aria-label="新标签页"],',
     'button[aria-label="退出全屏"] { display: none !important; }',
     /* ---- 右侧栏：手机端覆盖式抽屉（工作区文件 / 终端等）---- */
-    '[class*="rightbarCol"] {',
+    /* 收起：完全从布局移除（最兼容，Safari/微信内置浏览器都支持） */
+    '[class*="rightbarCol"] { display: none !important; }',
+    /* 打开：全屏覆盖 */
+    'body.dsm-right-open [class*="rightbarCol"] {',
+    '  display: block !important;',
     '  position: fixed !important;',
-    '  top: 0; bottom: 0; right: 0;',
+    '  top: 0 !important; left: 0 !important; right: 0 !important; bottom: 0 !important;',
     '  width: 100vw !important;',
     '  height: 100vh !important;',
     '  z-index: 820 !important;',
     '  background: #17171a;',
-    '  transform: translateX(105%);',
-    '  transition: transform .24s ease, visibility 0s linear .24s;',
     '  padding-top: env(safe-area-inset-top, 0px);',
     '  padding-bottom: env(safe-area-inset-bottom, 0px);',
     '  box-sizing: border-box;',
-    '  visibility: hidden;',
-    '  display: block !important;',
-    '}',
-    'body.dsm-right-open [class*="rightbarCol"] {',
-    '  transform: translateX(0);',
-    '  visibility: visible;',
-    '  transition: transform .24s ease;',
+    '  overflow-y: auto;',
     '}',
     '#dsm-right-mask { position: fixed; inset: 0; z-index: 819; background: rgba(0,0,0,.42);',
-    '  opacity: 0; pointer-events: none; transition: opacity .22s; }',
-    'body.dsm-right-open #dsm-right-mask { opacity: 1; pointer-events: auto; }',
+    '  display: none; }',
+    'body.dsm-right-open #dsm-right-mask { display: block; }',
     'body.dsm-right-open #dsm-menu, body.dsm-right-open #dsm-files { opacity: 0; pointer-events: none; }',
     /* ---- 输入框：16px 防止 iOS 聚焦自动放大 ---- */
     '[contenteditable="true"] { font-size: 16px !important; }',
@@ -199,7 +195,21 @@
       'stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' +
       '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M15 4v16"/></svg>';
     panelBtn.addEventListener('click', function () {
+      var willOpen = !document.body.classList.contains('dsm-right-open');
       document.body.classList.toggle('dsm-right-open');
+      if (willOpen) {
+        // 通知 DSH 重新计算布局（面板内容可能需要 resize 才会渲染）
+        setTimeout(function () {
+          try {
+            window.dispatchEvent(new Event('resize'));
+          } catch (e) { /* ignore */ }
+        }, 60);
+        setTimeout(function () {
+          try {
+            window.dispatchEvent(new Event('resize'));
+          } catch (e) { /* ignore */ }
+        }, 400);
+      }
     });
     document.body.appendChild(panelBtn);
 
