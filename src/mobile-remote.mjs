@@ -1,0 +1,528 @@
+/**
+ * ============================================================================
+ *  dsh-mobile-remote — 手机远程访问（宿主半）
+ * ============================================================================
+ *  让手机用 DSH 自己的端口访问电脑：
+ *
+ *     手机浏览器  →  http://<电脑局域网IP>:<DSH端口>/
+ *                     ├─ /             DeepSeek Harness（手机自适应 UI）
+ *                     └─ /files/       文件浏览（照片 / 文本 / 视频 / 下载）
+ *
+ *  为什么能同端口：DSH 只绑定 127.0.0.1:<port>（拒绝 0.0.0.0），
+ *  本插件绑定 <局域网IP>:<port>——同一端口的不同地址，互不冲突。
+ *
+ *  认证：插件运行在 DSH 进程内，直接向 connection 服务取 launchToken，
+ *       换成本机 cookie 后注入反代请求，手机端无需关心 token。
+ *
+ *  作者：AURORAL-极光实验室
+ *  联系：1907927628@qq.com
+ *  许可：MIT
+ *
+ *  挂载：profiles/web/cordis.patch.yml
+ *    - insert:
+ *        - id: mobile-remote
+ *          name: dsh-mobile-remote
+ *          config:
+ *            port: 0            # 0 = 与 DSH 同端口
+ *            bindHost: ""       # 空 = 自动检测局域网 IP
+ *            filesPort: 8789    # 内部文件服务端口（仅本机）
+ *            enabled: true
+ */
+import http from 'node:http'
+import net from 'node:net'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { spawn } from 'node:child_process'
+
+/* ------------------------------------------------------------------ */
+/*  常量与身份                                                          */
+/* ------------------------------------------------------------------ */
+const PLUGIN_NAME = 'mobile-remote'
+const INFO_ROUTE = '/dsh-mobile-remote/info'
+const ASSET_DIR = path.join(import.meta.dirname, 'mobile-remote-assets')
+const FILES_SERVER = path.join(ASSET_DIR, 'server.py')
+const MOBILE_JS_PATH = path.join(ASSET_DIR, 'mobile.js')
+/** 文件日志：DSH 控制台看不到时用来排查（plugin.log） */
+const LOG_FILE = path.join(import.meta.dirname, 'mobile-remote.log')
+
+export const name = PLUGIN_NAME
+export const inject = ['webServer']
+
+const AUTHOR = 'AURORAL-极光实验室'
+const EMAIL = '1907927628@qq.com'
+const VERSION = '1.0.0'
+const QR_ROUTE = '/dsh-mobile-remote/qr.svg'
+
+/** 电脑端右下角「手机扫码」浮层样式（注入到 index） */
+const FAB_CSS = `
+#mbr-fab{position:fixed;right:16px;bottom:16px;z-index:8000;font-family:system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif}
+#mbr-fab .mbr-fab-card{position:relative;background:rgba(22,28,40,.96);border:1px solid rgba(255,255,255,.14);border-radius:16px;padding:12px 12px 10px;box-shadow:0 16px 44px rgba(0,0,0,.5);text-align:center;-webkit-backdrop-filter:blur(16px);backdrop-filter:blur(16px);min-width:176px}
+#mbr-fab .mbr-fab-title{color:#e9eefb;font-size:12px;font-weight:600;line-height:18px}
+#mbr-fab .mbr-fab-qr{width:148px;height:148px;display:block;margin:8px auto 6px;background:#fff;border-radius:10px;padding:6px;box-sizing:border-box}
+#mbr-fab .mbr-fab-url{color:#8ea4c4;font-size:11px;line-height:16px;font-family:ui-monospace,Consolas,monospace;word-break:break-all}
+#mbr-fab .mbr-fab-tip{color:#6d82a3;font-size:10.5px;line-height:15px;margin-top:4px}
+#mbr-fab .mbr-fab-close{position:absolute;top:4px;right:6px;border:0;background:0 0;color:#8ea4c4;font-size:16px;line-height:1;cursor:pointer;padding:4px}
+#mbr-fab .mbr-fab-close:hover{color:#e9eefb}
+@media (max-width:760px){#mbr-fab{display:none}}
+`
+
+/** 电脑端注入脚本：只在非手机 UA 下显示扫码浮层 */
+const FAB_JS = `(function(){
+try{
+  if(/Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent||''))return;
+  if(localStorage.getItem('dsh-mobile-remote:fab')==='hidden')return;
+  var done=false;
+  function show(){
+    if(done||document.getElementById('mbr-fab'))return;
+    fetch('/dsh-mobile-remote/info',{cache:'no-store'}).then(function(r){return r.json()}).then(function(info){
+      if(!info||!info.running||!info.url||done)return;
+      done=true;
+      var box=document.createElement('div');
+      box.id='mbr-fab';
+      var qr='/dsh-mobile-remote/qr.svg?text='+encodeURIComponent(info.url);
+      box.innerHTML='<div class="mbr-fab-card">'
+        +'<div class="mbr-fab-title">📱 手机扫码访问</div>'
+        +'<img class="mbr-fab-qr" src="'+qr+'" alt="手机访问二维码">'
+        +'<div class="mbr-fab-url">'+String(info.url).replace(/^https?:\\/\\//,'')+'</div>'
+        +'<div class="mbr-fab-tip">同一 Wi-Fi · AI 首页 / files 文件</div>'
+        +'<button class="mbr-fab-close" title="收起">×</button>'
+        +'</div>';
+      document.body.appendChild(box);
+      box.querySelector('.mbr-fab-close').addEventListener('click',function(e){
+        e.stopPropagation();
+        localStorage.setItem('dsh-mobile-remote:fab','hidden');
+        box.remove();
+      });
+    }).catch(function(){});
+  }
+  if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',show);
+  else show();
+}catch(e){}
+})();`
+
+/** 对外暴露给浏览器端 UI 的状态（也是 /dsh-mobile-remote/info 的响应）。 */
+const state = {
+  plugin: PLUGIN_NAME,
+  version: VERSION,
+  author: AUTHOR,
+  email: EMAIL,
+  running: false,
+  bindHost: '',
+  port: 0,
+  url: '',
+  filesUrl: '',
+  error: '',
+}
+
+const log = (...args) => {
+  const msg = args.map((a) => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ')
+  console.log(`[${PLUGIN_NAME}]`, ...args)
+  try {
+    fs.appendFileSync(LOG_FILE, `[${new Date().toISOString()}] ${msg}\n`)
+  } catch (err) { /* 日志失败不影响功能 */ }
+}
+
+/* ------------------------------------------------------------------ */
+/*  工具                                                               */
+/* ------------------------------------------------------------------ */
+function json(res, status, body) {
+  res.writeHead(status, {
+    'content-type': 'application/json; charset=utf-8',
+    'cache-control': 'no-store',
+  })
+  res.end(JSON.stringify(body))
+}
+
+function text(res, status, body, type = 'text/plain; charset=utf-8') {
+  res.writeHead(status, { 'content-type': type, 'cache-control': 'no-store' })
+  res.end(body)
+}
+
+/** 本机第一个可用的局域网 IPv4（优先 192.168 / 10. / 172.）。 */
+function lanIp() {
+  const list = []
+  for (const items of Object.values(os.networkInterfaces())) {
+    for (const it of items || []) {
+      if (it.family === 'IPv4' && !it.internal) list.push(it.address)
+    }
+  }
+  const score = (ip) => (ip.startsWith('192.168.') ? 0 : ip.startsWith('10.') ? 1 : ip.startsWith('172.') ? 2 : 3)
+  list.sort((a, b) => score(a) - score(b))
+  return list[0] || ''
+}
+
+/** 读手机端注入脚本（每次请求现读，改完刷新页面就生效）。 */
+function readMobileJs() {
+  try {
+    return fs.readFileSync(MOBILE_JS_PATH, 'utf8')
+  } catch (err) {
+    return `/* mobile.js 缺失: ${err.message} */`
+  }
+}
+
+/** 用 DSH 进程内的 launchToken 换一个本机 authority 的 cookie。 */
+function exchangeToken(dshHost, dshPort, token) {
+  return new Promise((resolve) => {
+    const req = http.request({
+      host: dshHost,
+      port: dshPort,
+      method: 'GET',
+      path: `/?token=${encodeURIComponent(token)}`,
+      headers: { host: `${dshHost}:${dshPort}`, 'user-agent': 'dsh-mobile-remote/1.0' },
+      timeout: 5000,
+    }, (res) => {
+      const sc = res.headers['set-cookie']
+      res.resume()
+      resolve(res.statusCode === 303 && sc && sc.length ? String(sc[0]).split(';')[0] : '')
+    })
+    req.on('timeout', () => { req.destroy(); resolve('') })
+    req.on('error', () => resolve(''))
+    req.end()
+  })
+}
+
+/** 兜底：从 Edge / Chrome 历史里找 dsh web 启动 URL 的 token，换 cookie。 */
+async function cookieFromBrowserHistory(dshHost, dshPort) {
+  try {
+    let DatabaseSync = null
+    try { ({ DatabaseSync } = await import('node:sqlite')) } catch (err) { /* 无内置 sqlite */ }
+    const local = process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local')
+    const bases = [
+      path.join(local, 'Microsoft', 'Edge', 'User Data'),
+      path.join(local, 'Google', 'Chrome', 'User Data'),
+    ]
+    const seen = new Set()
+    for (const base of bases) {
+      let profiles = []
+      try {
+        profiles = fs.readdirSync(base, { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => d.name)
+      } catch (err) { continue }
+      for (const name of profiles) {
+        const hist = path.join(base, name, 'History')
+        if (!fs.existsSync(hist)) continue
+        try {
+          const tmp = path.join(os.tmpdir(), `dsh-mob-hist-${Date.now()}-${Math.random().toString(36).slice(2)}.sqlite`)
+          fs.copyFileSync(hist, tmp)
+          let urls = []
+          try {
+            if (!DatabaseSync) throw new Error('no sqlite')
+            const db = new DatabaseSync(tmp)
+            urls = db.prepare("SELECT url FROM urls WHERE url LIKE '%token=%' AND url LIKE '%3080%' ORDER BY last_visit_time DESC LIMIT 40").all().map((r) => r.url)
+            db.close()
+          } catch (err) {
+            urls = []
+          }
+          try { fs.unlinkSync(tmp) } catch (err) { /* ignore */ }
+          for (const url of urls) {
+            if (seen.has(url)) continue
+            seen.add(url)
+            try {
+              const token = new URL(url).searchParams.get('token')
+              if (!token) continue
+              const ck = await exchangeToken(dshHost, dshPort, token)
+              if (ck) return ck
+            } catch (err) { /* ignore */ }
+          }
+        } catch (err) { /* ignore */ }
+      }
+    }
+  } catch (err) { /* ignore */ }
+  return ''
+}
+
+/** 轮询一个本机端口直到可用。 */function waitForPort(host, port, timeoutMs = 15000) {
+  const started = Date.now()
+  return new Promise((resolve) => {
+    const attempt = () => {
+      const sock = net.connect(port, host)
+      sock.setTimeout(800)
+      sock.once('connect', () => { sock.destroy(); resolve(true) })
+      sock.once('error', () => {
+        sock.destroy()
+        if (Date.now() - started > timeoutMs) resolve(false)
+        else setTimeout(attempt, 400)
+      })
+      sock.once('timeout', () => { sock.destroy(); if (Date.now() - started > timeoutMs) resolve(false); else setTimeout(attempt, 400) })
+    }
+    attempt()
+  })
+}
+
+/* ------------------------------------------------------------------ */
+/*  插件主体                                                            */
+/* ------------------------------------------------------------------ */
+export function apply(ctx, config = {}) {
+  log('apply called, config=' + JSON.stringify(config))
+  const cfg = {
+    enabled: config.enabled !== false,
+    port: Number(config.port) || 0,
+    bindHost: String(config.bindHost || ''),
+    filesPort: Number(config.filesPort) || 8789,
+  }
+  if (!cfg.enabled) {
+    log('已按配置禁用')
+    return
+  }
+
+  ctx.inject(['webServer'], (c) => {
+    log('webServer 已注入')
+    const dshPort = c.webServer.port
+    const dshHost = c.webServer.host || '127.0.0.1'
+    log(`DSH 监听 ${dshHost}:${dshPort}`)
+
+    /* 浏览器端 UI 查询用的信息路由（注册在 DSH 自己的 webServer 上） */
+    c.effect(() => c.webServer.register({
+      kind: 'exact',
+      path: INFO_ROUTE,
+      handler: (req, res) => {
+        if (req.method !== 'GET' && req.method !== 'HEAD') return text(res, 405, 'method not allowed')
+        json(res, 200, state)
+      },
+    }), `${PLUGIN_NAME}: info 路由`)
+
+    /* 注意：二维码路由与「手机扫码」浮层由独立插件 mobile-remote-qr 提供。
+       这里不能重复注册 /dsh-mobile-remote/qr.svg —— webserver 的同路径
+       重复注册会抛错，导致整个插件 fiber 启动失败（联调时踩过）。 */
+
+    /* 对外服务 + 内部文件服务的生命周期 */
+    c.effect(() => {
+      let cleanup = () => { /* noop */ }
+      let stopped = false
+      start(c, dshHost, dshPort).then((fn) => {
+        if (stopped) { fn(); return }
+        cleanup = fn
+      }).catch((err) => {
+        state.error = err && err.message ? err.message : String(err)
+        state.running = false
+        log('启动失败：', state.error)
+      })
+      return () => {
+        stopped = true
+        try { cleanup() } catch (err) { /* 释放期异常忽略 */ }
+        state.running = false
+      }
+    }, `${PLUGIN_NAME}: 对外服务生命周期`)
+
+    async function start(c2, dshHost2, dshPort2) {
+      /* 1. 选绑定地址与端口：与 DSH 同端口、不同地址 */
+      const bindHost = cfg.bindHost || lanIp()
+      if (!bindHost) throw new Error('没有检测到局域网 IP，请在插件 config 里设置 bindHost')
+      let port = cfg.port || dshPort2
+      if (bindHost === dshHost2) port = dshPort2 + 1
+
+      /* 2. 取认证 cookie（优先进程内 launchToken；拿不到就回退浏览器历史 token） */
+      let cookie = ''
+      try {
+        const conn = (typeof c2.get === 'function' ? c2.get('connection') : null) || c2.connection
+        const token = conn && conn.browserAuth && conn.browserAuth.launchToken
+        if (token) cookie = await exchangeToken(dshHost2, dshPort2, token)
+      } catch (err) { /* 忽略 */ }
+      if (!cookie) {
+        cookie = await cookieFromBrowserHistory(dshHost2, dshPort2)
+        if (cookie) log('已通过浏览器历史 token 获取 cookie')
+      }
+      if (!cookie) log('警告：未换到 DSH cookie，AI 页面可能需要手动处理认证')
+
+      /* 3. 内部文件服务（Python + Pillow） */
+      // 优先用插件内置的便携 Python（别人拿到不用装环境），没有才回退系统 python
+      const bundledPython = path.join(ASSET_DIR, 'python', 'python.exe')
+      const python = process.env.PYTHON || (fs.existsSync(bundledPython) ? bundledPython : 'python')
+      const publicUrl = `http://${bindHost}:${port}/`
+      const py = spawn(python, [
+        FILES_SERVER,
+        '--port', String(cfg.filesPort),
+        '--bind', '127.0.0.1',
+        '--no-banner', '--no-qr', '--no-browser',
+        '--public-url', publicUrl,
+        '--parent-pid', String(process.pid),
+      ], { cwd: ASSET_DIR, windowsHide: true, stdio: 'ignore' })
+      py.on('error', (err) => log('文件服务启动失败：', err.message))
+      py.on('exit', (code) => log('文件服务已退出', code))
+
+      const filesReady = await waitForPort('127.0.0.1', cfg.filesPort, 15000)
+      if (!filesReady) log('警告：文件服务未就绪，/files/ 可能不可用')
+
+      /* 4. 对外 HTTP 服务（同端口，局域网地址） */
+      const dsh = { host: dshHost2, port: dshPort2, hostHeader: `${dshHost2}:${dshPort2}` }
+      const server = http.createServer((req, res) => {
+        try { route(req, res) } catch (err) {
+          log('请求处理异常：', err && err.message)
+          try { text(res, 500, 'internal error') } catch (e) { /* ignore */ }
+        }
+      })
+      server.on('upgrade', (req, socket, head) => {
+        try { upgrade(req, socket, head) } catch (err) { try { socket.destroy() } catch (e) { /* ignore */ } }
+      })
+
+      await new Promise((resolve, reject) => {
+        server.once('error', reject)
+        server.listen(port, bindHost, () => resolve())
+      })
+
+      state.running = true
+      state.bindHost = bindHost
+      state.port = port
+      state.url = publicUrl
+      state.filesUrl = publicUrl + 'files/'
+      state.error = ''
+      log(`手机访问已就绪：${publicUrl}   （文件：${state.filesUrl}）`)
+      log(`作者：${AUTHOR} <${EMAIL}>`)
+
+      /* ---------------- 路由分流 ---------------- */
+      function route(req, res) {
+        const pathname = (req.url || '/').split('?')[0]
+
+        // 手机端注入脚本
+        if (pathname === '/__mobile/mobile.js') {
+          return text(res, 200, readMobileJs(), 'text/javascript; charset=utf-8')
+        }
+        if (pathname === '/__mobile/health') {
+          return json(res, 200, { ok: state.running, url: state.url, files: state.filesUrl })
+        }
+
+        // 文件浏览：/files/... → 内部 Python（/files/fapi/... → /api/...）
+        if (pathname === '/files') {
+          res.writeHead(302, { location: '/files/', 'cache-control': 'no-store' })
+          return res.end()
+        }
+        if (pathname.startsWith('/files/')) {
+          let upstream = req.url.slice('/files'.length)
+          if (upstream.startsWith('/fapi/')) upstream = '/api/' + upstream.slice('/fapi/'.length)
+          else if (upstream === '/fmanifest.webmanifest' || upstream.startsWith('/fmanifest.webmanifest?')) {
+            upstream = '/manifest.webmanifest' + upstream.slice('/fmanifest.webmanifest'.length)
+          }
+          return proxyFiles(req, res, upstream)
+        }
+
+        // 其余全部是 DSH
+        return proxyDsh(req, res)
+      }
+
+      /* ---------------- 文件服务反代 ---------------- */
+      function proxyFiles(req, res, upstreamPath) {
+        const headers = { ...req.headers, host: `127.0.0.1:${cfg.filesPort}` }
+        delete headers['accept-encoding']
+        const up = http.request({
+          host: '127.0.0.1',
+          port: cfg.filesPort,
+          method: req.method,
+          path: upstreamPath,
+          headers,
+        }, (upRes) => {
+          const h = { ...upRes.headers }
+          delete h['transfer-encoding']
+          res.writeHead(upRes.statusCode, h)
+          upRes.pipe(res)
+        })
+        up.on('error', () => {
+          if (res.headersSent) return
+          text(res, 502, '文件服务未就绪，请稍后刷新')
+        })
+        req.pipe(up)
+      }
+
+      /* ---------------- DSH 反代 ---------------- */
+      function upstreamHeaders(req) {
+        const h = { ...req.headers }
+        h.host = dsh.hostHeader
+        delete h.cookie
+        if (cookie) h.cookie = cookie
+        if (h.origin) h.origin = `http://${dsh.hostHeader}`
+        if (h.referer) h.referer = String(h.referer).replace(/^https?:\/\/[^/]+/, `http://${dsh.hostHeader}`)
+        h['sec-fetch-site'] = 'same-origin'
+        return h
+      }
+
+      function proxyDsh(req, res) {
+        const pathname = (req.url || '/').split('?')[0]
+        const isDocument = req.method === 'GET' && (pathname === '/' || pathname === '/index.html')
+        const upHeaders = upstreamHeaders(req)
+        if (isDocument) delete upHeaders['accept-encoding']
+
+        const proxyReq = http.request({
+          host: dsh.host,
+          port: dsh.port,
+          method: req.method,
+          path: req.url,
+          headers: upHeaders,
+        }, (proxyRes) => {
+          const headers = { ...proxyRes.headers }
+          delete headers['set-cookie']
+          delete headers['strict-transport-security']
+
+          // 页面文档注入手机端脚本
+          if (isDocument && /text\/html/i.test(String(headers['content-type'] || ''))) {
+            const chunks = []
+            proxyRes.on('data', (chunk) => chunks.push(chunk))
+            proxyRes.on('end', () => {
+              let html = Buffer.concat(chunks).toString('utf8')
+              const tag = '<script src="/__mobile/mobile.js" defer></script>'
+              html = html.includes('</body>') ? html.replace('</body>', tag + '</body>') : html + tag
+              const buf = Buffer.from(html, 'utf8')
+              headers['content-length'] = String(buf.length)
+              delete headers['transfer-encoding']
+              delete headers['content-encoding']
+              res.writeHead(proxyRes.statusCode, headers)
+              res.end(buf)
+            })
+            proxyRes.on('error', () => { try { res.destroy() } catch (e) { /* ignore */ } })
+            return
+          }
+
+          res.writeHead(proxyRes.statusCode, headers)
+          proxyRes.pipe(res)
+        })
+
+        proxyReq.on('error', (err) => {
+          if (res.headersSent) return
+          text(res, 502, '无法连接 DSH 服务：' + err.message)
+        })
+        req.pipe(proxyReq)
+      }
+
+      /* ---------------- WebSocket 反代 ---------------- */
+      function upgrade(req, socket, head) {
+        const upstream = net.connect(dsh.port, dsh.host, () => {
+          const h = upstreamHeaders(req)
+          delete h.connection
+          delete h.upgrade
+          delete h['sec-websocket-key']
+          delete h['sec-websocket-version']
+          delete h['sec-websocket-extensions']
+          delete h['sec-websocket-protocol']
+
+          const lines = [`GET ${req.url} HTTP/1.1`]
+          for (const [key, value] of Object.entries(h)) {
+            if (Array.isArray(value)) value.forEach((v) => lines.push(`${key}: ${v}`))
+            else if (value !== undefined) lines.push(`${key}: ${value}`)
+          }
+          lines.push('Connection: Upgrade')
+          lines.push('Upgrade: websocket')
+          lines.push(`Sec-WebSocket-Key: ${req.headers['sec-websocket-key']}`)
+          lines.push('Sec-WebSocket-Version: 13')
+          if (req.headers['sec-websocket-protocol']) {
+            lines.push(`Sec-WebSocket-Protocol: ${req.headers['sec-websocket-protocol']}`)
+          }
+          upstream.write(lines.join('\r\n') + '\r\n\r\n')
+          if (head && head.length) upstream.write(head)
+          upstream.pipe(socket)
+          socket.pipe(upstream)
+        })
+        upstream.on('error', () => { try { socket.destroy() } catch (e) { /* ignore */ } })
+        socket.on('error', () => { try { upstream.destroy() } catch (e) { /* ignore */ } })
+        socket.on('close', () => { try { upstream.destroy() } catch (e) { /* ignore */ } })
+        upstream.on('close', () => { try { socket.destroy() } catch (e) { /* ignore */ } })
+      }
+
+      /* ---------------- 清理句柄 ---------------- */
+      return () => {
+        try { server.close() } catch (err) { /* ignore */ }
+        try { py.kill() } catch (err) { /* ignore */ }
+        log('对外服务已停止')
+      }
+    }
+  })
+}
+
+export default { name, inject, apply }
