@@ -120,17 +120,16 @@
     'body.dsm-sb-open #dsm-panel { opacity: 0; pointer-events: none; }',
     'body.dsm-right-open #dsm-panel { background: rgba(79,140,255,.9); }',
     /* ---- 壁纸（手机/平板专用）----
-       不依赖 wallpaper 插件的 CSS 变量与 background-attachment:fixed
-       （老 Android / 华为浏览器对 fixed 背景支持差，图片层会不渲染） */
+       只覆盖两项，其余（size/position/repeat）完全跟随电脑端的计算结果：
+         1. background-image：去掉 CSS 变量与 fixed 依赖，保证老 Android 能渲染
+         2. background-attachment: scroll（老 Android 不支持 fixed） */
     'body {',
-    '  background-image: linear-gradient(rgba(9,11,15,0.30), rgba(9,11,15,0.30)), url("/dsh-bg-img/session.png") !important;',
-    '  background-size: auto, cover !important;',
-    '  background-position: center, center !important;',
-    '  background-repeat: no-repeat !important;',
-    '  background-attachment: scroll !important;',
-    '  background-color: #0b0e14 !important;',
+    '  background-image: linear-gradient(rgba(255,255,255,0.35), rgba(255,255,255,0.35)), url("/dsh-bg-img/session.png") !important;',
+    '  background-attachment: scroll, scroll !important;',
     '}',
-    '#root, #root > div, [class*="frame"] { background-color: transparent !important; }',
+    'body[data-ds-dark-theme] {',
+    '  background-image: linear-gradient(rgba(21,21,23,0.35), rgba(21,21,23,0.35)), url("/dsh-bg-img/session.png") !important;',
+    '}',
     /* ---- 给 ☰ 让出位置 ---- */
     '[class*="centerCol"] header { padding-left: 56px !important; padding-right: 140px !important; }',
     /* ---- 隐藏桌面专属控件 ---- */
