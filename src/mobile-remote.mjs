@@ -250,6 +250,29 @@ async function cookieFromBrowserHistory(dshHost, dshPort) {
   })
 }
 
+/** 等一个本机端口彻底释放（重绑文件服务前用，避免新进程 EADDRINUSE）。 */
+function waitForPortGone(host, port, timeoutMs = 5000) {
+  const started = Date.now()
+  return new Promise((resolve) => {
+    const attempt = () => {
+      const sock = net.connect(port, host)
+      sock.setTimeout(600)
+      sock.once('connect', () => {
+        sock.destroy()
+        if (Date.now() - started > timeoutMs) resolve(false)
+        else setTimeout(attempt, 300)
+      })
+      sock.once('error', () => { sock.destroy(); resolve(true) })
+      sock.once('timeout', () => {
+        sock.destroy()
+        if (Date.now() - started > timeoutMs) resolve(false)
+        else setTimeout(attempt, 300)
+      })
+    }
+    attempt()
+  })
+}
+
 /* ------------------------------------------------------------------ */
 /*  插件主体                                                            */
 /* ------------------------------------------------------------------ */
@@ -309,11 +332,15 @@ export function apply(ctx, config = {}) {
     }, `${PLUGIN_NAME}: 对外服务生命周期`)
 
     async function start(c2, dshHost2, dshPort2) {
-      /* 1. 选绑定地址与端口：与 DSH 同端口、不同地址 */
-      const bindHost = cfg.bindHost || lanIp()
-      if (!bindHost) throw new Error('没有检测到局域网 IP，请在插件 config 里设置 bindHost')
-      let port = cfg.port || dshPort2
-      if (bindHost === dshHost2) port = dshPort2 + 1
+      /* 1. 绑定地址与端口在 boot() 内决定：与 DSH 同端口、不同地址。
+            局域网 IP 变化后自动重绑（见末尾的「IP 跟随」定时器）。 */
+      let liveServer = null
+      let livePy = null
+      let watchTimer = null
+      let filesStopped = false      // 主动停止（重绑/清理）时不触发守护重启
+      let filesRestarts = 0         // 文件服务意外退出后的重启次数
+      let rebinding = false
+      const dsh = { host: dshHost2, port: dshPort2, hostHeader: `${dshHost2}:${dshPort2}` }
 
       /* 2. 认证 cookie：实时获取 + 后台重试（启动时 connection 服务可能尚未就绪） */
       let authCookie = ''
@@ -363,50 +390,107 @@ export function apply(ctx, config = {}) {
         log('警告：仍未获取到 DSH cookie，AI 页面可能短暂返回等待页（会自动重试）')
       })()
 
-      /* 3. 内部文件服务（Python + Pillow） */
+      /* 3-4. 对外服务 + 内部文件服务：由 boot() 建立，IP 变化时可反复重绑 */
       // 优先用插件内置的便携 Python（别人拿到不用装环境），没有才回退系统 python
       const bundledPython = path.join(ASSET_DIR, 'python', 'python.exe')
-      const python = process.env.PYTHON || (fs.existsSync(bundledPython) ? bundledPython : 'python')
-      const publicUrl = `http://${bindHost}:${port}/`
-      const py = spawn(python, [
-        FILES_SERVER,
-        '--port', String(cfg.filesPort),
-        '--bind', '127.0.0.1',
-        '--no-banner', '--no-qr', '--no-browser',
-        '--public-url', publicUrl,
-        '--parent-pid', String(process.pid),
-      ], { cwd: ASSET_DIR, windowsHide: true, stdio: 'ignore' })
-      py.on('error', (err) => log('文件服务启动失败：', err.message))
-      py.on('exit', (code) => log('文件服务已退出', code))
+      const pythonBin = process.env.PYTHON || (fs.existsSync(bundledPython) ? bundledPython : 'python')
 
-      const filesReady = await waitForPort('127.0.0.1', cfg.filesPort, 15000)
-      if (!filesReady) log('警告：文件服务未就绪，/files/ 可能不可用')
+      async function boot(host) {
+        const port = host === dshHost2 ? dshPort2 + 1 : (cfg.port || dshPort2)
+        const publicUrl = `http://${host}:${port}/`
 
-      /* 4. 对外 HTTP 服务（同端口，局域网地址） */
-      const dsh = { host: dshHost2, port: dshPort2, hostHeader: `${dshHost2}:${dshPort2}` }
-      const server = http.createServer((req, res) => {
-        try { route(req, res) } catch (err) {
-          log('请求处理异常：', err && err.message)
-          try { text(res, 500, 'internal error') } catch (e) { /* ignore */ }
+        /* 3. 内部文件服务（Python + Pillow）——带守护：意外退出自动重启 */
+        let py = null
+        filesStopped = false
+        filesRestarts = 0
+        const startPy = async () => {
+          await waitForPortGone('127.0.0.1', cfg.filesPort, 5000)
+          py = spawn(pythonBin, [
+            FILES_SERVER,
+            '--port', String(cfg.filesPort),
+            '--bind', '127.0.0.1',
+            '--no-banner', '--no-qr', '--no-browser',
+            '--public-url', publicUrl,
+            '--parent-pid', String(process.pid),
+          ], { cwd: ASSET_DIR, windowsHide: true, stdio: 'ignore' })
+          py.on('error', (err) => log('文件服务启动失败：', err.message))
+          py.on('exit', (code) => {
+            log('文件服务已退出', code)
+            if (filesStopped) return
+            filesRestarts++
+            if (filesRestarts > 8) {
+              log('文件服务多次重启失败，停止守护（重启 DSH 可恢复）')
+              return
+            }
+            const delay = Math.min(30000, 800 * Math.pow(2, filesRestarts - 1))
+            log(`文件服务将在 ${delay}ms 后自动重启（第 ${filesRestarts} 次）`)
+            setTimeout(async () => {
+              if (filesStopped) return
+              try {
+                await startPy()
+                livePy = py
+                log('文件服务已自动恢复')
+              } catch (err) {
+                log('文件服务自动重启失败：', err && err.message)
+              }
+            }, delay)
+          })
+          const filesReady = await waitForPort('127.0.0.1', cfg.filesPort, 15000)
+          if (!filesReady) log('警告：文件服务未就绪，/files/ 可能不可用')
         }
-      })
-      server.on('upgrade', (req, socket, head) => {
-        try { upgrade(req, socket, head) } catch (err) { try { socket.destroy() } catch (e) { /* ignore */ } }
-      })
+        await startPy()
 
-      await new Promise((resolve, reject) => {
-        server.once('error', reject)
-        server.listen(port, bindHost, () => resolve())
-      })
+        /* 4. 对外 HTTP 服务（同端口，局域网地址） */
+        const srv = http.createServer((req, res) => {
+          try { route(req, res) } catch (err) {
+            log('请求处理异常：', err && err.message)
+            try { text(res, 500, 'internal error') } catch (e) { /* ignore */ }
+          }
+        })
+        srv.on('upgrade', (req, socket, head) => {
+          try { upgrade(req, socket, head) } catch (err) { try { socket.destroy() } catch (e) { /* ignore */ } }
+        })
 
-      state.running = true
-      state.bindHost = bindHost
-      state.port = port
-      state.url = publicUrl
-      state.filesUrl = publicUrl + 'files/'
-      state.error = ''
-      log(`手机访问已就绪：${publicUrl}   （文件：${state.filesUrl}）`)
-      log(`作者：${AUTHOR} <${EMAIL}>`)
+        await new Promise((resolve, reject) => {
+          srv.once('error', reject)
+          srv.listen(port, host, () => resolve())
+        })
+
+        liveServer = srv
+        livePy = py
+        state.running = true
+        state.bindHost = host
+        state.port = port
+        state.url = publicUrl
+        state.filesUrl = publicUrl + 'files/'
+        state.error = ''
+        log(`手机访问已就绪：${publicUrl}   （文件：${state.filesUrl}）`)
+        log(`作者：${AUTHOR} <${EMAIL}>`)
+      }
+
+      /** 关掉当前对外服务与文件服务（重绑前调用）。 */
+      async function teardown() {
+        state.running = false
+        filesStopped = true
+        const srv = liveServer
+        liveServer = null
+        if (srv) {
+          await new Promise((resolve) => {
+            let done = false
+            const finish = () => { if (!done) { done = true; resolve() } }
+            try { srv.close(finish) } catch (err) { finish() }
+            setTimeout(finish, 1500)
+          })
+        }
+        const py = livePy
+        livePy = null
+        if (py) { try { py.kill() } catch (err) { /* ignore */ } }
+      }
+
+      /* 首次绑定：config 指定优先，否则自动检测局域网 IP */
+      const firstHost = cfg.bindHost || lanIp()
+      if (!firstHost) throw new Error('没有检测到局域网 IP，请在插件 config 里设置 bindHost')
+      await boot(firstHost)
 
       /* ---------------- 路由分流 ---------------- */
       function route(req, res) {
@@ -611,10 +695,39 @@ export function apply(ctx, config = {}) {
         upstream.on('close', () => { try { socket.destroy() } catch (e) { /* ignore */ } })
       }
 
+      /* ---------------- 5. 局域网 IP 跟随 ---------------- */
+      /* 换网络 / 路由器重启后 DHCP 会换地址；这里每 6 秒核对一次，
+         一变就在几秒内把对外服务重绑到新地址，手机 URL / 二维码随之更新。 */
+      if (!cfg.bindHost) {
+        watchTimer = setInterval(async () => {
+          if (rebinding) return
+          const nowIp = lanIp()
+          if (!nowIp || nowIp === state.bindHost) return
+          rebinding = true
+          const prevIp = state.bindHost
+          log(`检测到局域网 IP 变化：${prevIp || '(未绑定)'} → ${nowIp}，开始自动重绑`)
+          try {
+            await teardown()
+            await boot(nowIp)
+            log(`自动重绑完成：${state.url}`)
+          } catch (err) {
+            state.error = err && err.message ? err.message : String(err)
+            state.running = false
+            log('自动重绑失败：', state.error)
+          } finally {
+            rebinding = false
+          }
+        }, 6000)
+        if (typeof watchTimer.unref === 'function') watchTimer.unref()
+      }
+
       /* ---------------- 清理句柄 ---------------- */
       return () => {
-        try { server.close() } catch (err) { /* ignore */ }
-        try { py.kill() } catch (err) { /* ignore */ }
+        filesStopped = true
+        if (watchTimer) { clearInterval(watchTimer); watchTimer = null }
+        if (liveServer) { try { liveServer.close() } catch (err) { /* ignore */ } liveServer = null }
+        if (livePy) { try { livePy.kill() } catch (err) { /* ignore */ } livePy = null }
+        state.running = false
         log('对外服务已停止')
       }
     }

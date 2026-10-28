@@ -82,15 +82,36 @@ try{
       var qrSrc='/dsh-mobile-remote/qr.svg?text='+encodeURIComponent(url);
       var pretty=String(url).replace(/^https?:\\/\\//,'');
 
-      /* ---- 左上角常驻按钮 ---- */
+      /* ---- 左上角常驻按钮（等 logoRow 渲染后再插入，避免压住 logo） ---- */
       if(!document.getElementById('mbr-qr-btn')){
         var btn=document.createElement('button');
         btn.id='mbr-qr-btn';
         btn.title='手机访问二维码';
         btn.innerHTML='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><path d="M14 14h3v3h-3zM19 19h2v2h-2z"/></svg><span>手机</span>';
-        var row=document.querySelector('[class*="logoRow"]');
-        if(row){ row.appendChild(btn); }
-        else { document.body.appendChild(btn); btn.style.position='fixed'; btn.style.left='8px'; btn.style.top='8px'; btn.style.zIndex='9000'; }
+        var attached=false;
+        function tryAttach(){
+          if(attached)return true;
+          var row=document.querySelector('[class*="logoRow"]');
+          if(row){ row.appendChild(btn); attached=true; return true; }
+          return false;
+        }
+        if(!tryAttach()){
+          var tries=0;
+          var timer=setInterval(function(){
+            if(tryAttach()){ clearInterval(timer); return; }
+            if(++tries>30){ clearInterval(timer); }
+          },200);
+          /* 兜底：6 秒后仍没找到 logoRow 才用固定定位（右侧、避开 logo） */
+          setTimeout(function(){
+            if(!attached){
+              document.body.appendChild(btn);
+              btn.style.position='fixed';
+              btn.style.right='12px';
+              btn.style.top='8px';
+              btn.style.zIndex='9000';
+            }
+          },6000);
+        }
       }
 
       /* ---- 二维码弹窗 ---- */
@@ -117,13 +138,16 @@ try{
           }catch(e){}
         });
       }
-      var btnEl=document.getElementById('mbr-qr-btn');
       var modalEl=document.getElementById('mbr-qr-modal');
       function open(){ modalEl.classList.add('open'); }
       function close(){ modalEl.classList.remove('open'); }
-      if(btnEl){ btnEl.addEventListener('click',open); }
-      modalEl.querySelector('.mbr-qr-x').addEventListener('click',close);
-      modalEl.querySelector('.mbr-qr-close2').addEventListener('click',close);
+      /* 事件委托：按钮是异步插入 logoRow 的，用 document 级监听保证一定能响应 */
+      document.addEventListener('click',function(e){
+        var t=e.target;
+        if(!t||!t.closest)return;
+        if(t.closest('#mbr-qr-btn')){ open(); return; }
+        if(t.closest('.mbr-qr-x')||t.closest('.mbr-qr-close2')){ close(); }
+      });
       modalEl.addEventListener('click',function(e){ if(e.target===modalEl)close(); });
       document.addEventListener('keydown',function(e){ if(e.key==='Escape')close(); });
 
